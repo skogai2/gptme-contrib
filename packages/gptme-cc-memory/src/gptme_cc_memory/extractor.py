@@ -85,8 +85,50 @@ class ExtractionResult:
     session_context: dict[str, Any] = field(default_factory=dict)
 
 
+def _normalize_message(raw: dict[str, Any]) -> dict[str, Any] | None:
+    """Normalize one transcript line to ``{"role": "human"|"assistant", "content": str}``.
+
+    Two shapes are accepted:
+
+    - gptme's own flat trajectory format: ``{"role": "human"|"assistant", "content": "..."}``
+    - Claude Code's actual transcript format: ``{"type": "user"|"assistant",
+      "message": {"role": "user"|"assistant", "content": "..." | [blocks]}}``,
+      where ``content`` may be a string or a list of content blocks (only
+      ``type: "text"`` blocks are kept; tool_use/tool_result are dropped).
+    """
+    if isinstance(raw.get("content"), str) and raw.get("role") in ("human", "assistant"):
+        return raw
+
+    if raw.get("type") not in ("user", "assistant"):
+        return None
+    inner = raw.get("message")
+    if not isinstance(inner, dict):
+        return None
+
+    role = "human" if inner.get("role") == "user" else inner.get("role")
+    if role not in ("human", "assistant"):
+        return None
+
+    content = inner.get("content")
+    if isinstance(content, list):
+        content = "\n".join(
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    if not isinstance(content, str) or not content:
+        return None
+
+    return {"role": role, "content": content}
+
+
 def read_trajectory(trajectory_path: Path) -> list[dict[str, Any]]:
-    """Read a Claude Code trajectory file (JSONL, one JSON object per line)."""
+    """Read a Claude Code trajectory file (JSONL, one JSON object per line).
+
+    Each line is normalized via :func:`_normalize_message` so downstream
+    detectors can rely on a flat ``{"role", "content"}`` shape regardless of
+    which trajectory format (gptme or Claude Code) produced the file.
+    """
     messages: list[dict[str, Any]] = []
     try:
         for line in trajectory_path.read_text(encoding="utf-8").strip().splitlines():
@@ -94,11 +136,14 @@ def read_trajectory(trajectory_path: Path) -> list[dict[str, Any]]:
             if not line:
                 continue
             try:
-                msg = json.loads(line)
-                if isinstance(msg, dict):
-                    messages.append(msg)
+                raw = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(raw, dict):
+                continue
+            normalized = _normalize_message(raw)
+            if normalized is not None:
+                messages.append(normalized)
     except OSError:
         return []
     return messages
